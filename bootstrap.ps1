@@ -16,6 +16,11 @@
     Usage on each machine (PowerShell):
         irm https://raw.githubusercontent.com/billybnyc/ChiroTVScreens/main/bootstrap.ps1 | iex
 
+    That one line does everything: Session Keeper, the kiosk settings, and
+    automatic Windows sign-in. You will be asked for the Windows password
+    once, in the window that asks permission. Press Enter at that prompt to
+    leave automatic sign-in alone.
+
     To avoid the login prompt on a new machine, set these first:
         $env:CHIROTV_USER = "yourusername"
         $env:CHIROTV_PASS = "yourpassword"
@@ -24,6 +29,14 @@
     This file is pure ASCII on purpose. Windows PowerShell 5.1 reads .ps1 as
     Windows-1252, and a UTF-8 dash breaks parsing.
 #>
+
+[CmdletBinding()]
+param(
+    [switch] $SkipKiosk,          # do not touch sleep / screensaver / update settings
+    [switch] $SkipAutoLogon,      # do NOT set up automatic Windows sign-in
+    [int]    $ActiveHoursStart = 7,
+    [int]    $ActiveHoursEnd   = 19
+)
 
 $ErrorActionPreference = "Stop"
 
@@ -42,9 +55,11 @@ function Fail ($m) { Write-Host ""; Write-Host "FAILED: $m" -ForegroundColor Red
 # PowerShell 5.1 negotiates TLS 1.0 by default; GitHub refuses it.
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
+$BootstrapBuild = "b2 (2026-11-02) - autologon on by default"
+
 Write-Host ""
-Write-Host "  Session Keeper deploy" -ForegroundColor White
-Write-Host "  ---------------------"
+Write-Host "  Session Keeper deploy  $BootstrapBuild" -ForegroundColor White
+Write-Host "  ------------------------------------------------------"
 
 $venvPython = Join-Path $InstallDir ".venv\Scripts\python.exe"
 $envFile    = Join-Path $InstallDir ".env"
@@ -235,6 +250,146 @@ try {
 } catch {
     Warn "Could not reach the manifest: $($_.Exception.Message)"
     Warn "The screen will still run; it just will not receive central updates yet."
+}
+
+# ---------------------------------------------------------------------------
+# Kiosk settings - needs administrator, so it runs in its own elevated window
+# ---------------------------------------------------------------------------
+if (-not $SkipKiosk) {
+    Step "Preparing the machine to run unattended"
+
+    $alreadyAdmin = ([Security.Principal.WindowsPrincipal] `
+        [Security.Principal.WindowsIdentity]::GetCurrent()
+        ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    $hardening = @'
+param([int] $ActiveHoursStart = 7, [int] $ActiveHoursEnd = 19, [switch] $EnableAutoLogon)
+$ErrorActionPreference = "Continue"
+Write-Host ""
+Write-Host "  Kiosk settings" -ForegroundColor Cyan
+Write-Host "  --------------"
+
+powercfg /change monitor-timeout-ac 0   | Out-Null
+powercfg /change monitor-timeout-dc 0   | Out-Null
+powercfg /change standby-timeout-ac 0   | Out-Null
+powercfg /change standby-timeout-dc 0   | Out-Null
+powercfg /change hibernate-timeout-ac 0 | Out-Null
+powercfg /change hibernate-timeout-dc 0 | Out-Null
+powercfg /change disk-timeout-ac 0      | Out-Null
+Write-Host "  [ok] Display and sleep set to Never" -ForegroundColor Green
+
+powercfg /setacvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0 2>$null
+powercfg /setdcvalueindex SCHEME_CURRENT SUB_NONE CONSOLELOCK 0 2>$null
+powercfg /setactive SCHEME_CURRENT 2>$null
+Write-Host "  [ok] Sign-in on wake disabled" -ForegroundColor Green
+
+foreach ($root in @("HKCU:\Control Panel\Desktop", "HKU:\.DEFAULT\Control Panel\Desktop")) {
+    try {
+        if (Test-Path $root) {
+            Set-ItemProperty -Path $root -Name ScreenSaveActive -Value "0" -Force
+            Set-ItemProperty -Path $root -Name ScreenSaveTimeOut -Value "0" -Force
+            Set-ItemProperty -Path $root -Name ScreenSaverIsSecure -Value "0" -Force
+        }
+    } catch { }
+}
+Write-Host "  [ok] Screensaver disabled" -ForegroundColor Green
+
+try {
+    $sys = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System"
+    if (-not (Test-Path $sys)) { New-Item -Path $sys -Force | Out-Null }
+    Set-ItemProperty -Path $sys -Name "InactivityTimeoutSecs" -Value 0 -Type DWord -Force
+    Write-Host "  [ok] Idle lock disabled" -ForegroundColor Green
+} catch { Write-Host "  [!]  Could not disable idle lock" -ForegroundColor Yellow }
+
+try {
+    $au = "HKLM:\SOFTWARE\Microsoft\WindowsUpdate\UX\Settings"
+    if (-not (Test-Path $au)) { New-Item -Path $au -Force | Out-Null }
+    Set-ItemProperty -Path $au -Name "ActiveHoursStart" -Value $ActiveHoursStart -Type DWord -Force
+    Set-ItemProperty -Path $au -Name "ActiveHoursEnd"   -Value $ActiveHoursEnd   -Type DWord -Force
+    Set-ItemProperty -Path $au -Name "IsActiveHoursEnabled" -Value 1 -Type DWord -Force
+    Write-Host ("  [ok] No update reboots between {0:00}:00 and {1:00}:00" -f $ActiveHoursStart, $ActiveHoursEnd) -ForegroundColor Green
+} catch { Write-Host "  [!]  Could not set active hours" -ForegroundColor Yellow }
+
+try {
+    $pl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\PasswordLess\Device"
+    if (-not (Test-Path $pl)) { New-Item -Path $pl -Force | Out-Null }
+    Set-ItemProperty -Path $pl -Name DevicePasswordLessBuildVersion -Value 0 -Type DWord -Force
+    Write-Host "  [ok] netplwiz auto sign-in tick box unhidden" -ForegroundColor Green
+} catch { Write-Host "  [!]  Could not unhide the netplwiz tick box" -ForegroundColor Yellow }
+
+if ($EnableAutoLogon) {
+    Write-Host ""
+    Write-Host "  Automatic Windows sign-in for $env:USERNAME" -ForegroundColor Cyan
+    Write-Host "  Anyone who powers this PC on will get a desktop with no password." -ForegroundColor Yellow
+    Write-Host ""
+    $secure = Read-Host "  Windows password for $env:USERNAME (blank to skip)" -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+    try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    if ($plain) {
+        $wl = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        Set-ItemProperty -Path $wl -Name "AutoAdminLogon" -Value "1" -Force
+        Set-ItemProperty -Path $wl -Name "DefaultUserName" -Value $env:USERNAME -Force
+        Set-ItemProperty -Path $wl -Name "DefaultDomainName" -Value $env:COMPUTERNAME -Force
+        Remove-ItemProperty -Path $wl -Name "AutoLogonCount" -ErrorAction SilentlyContinue
+
+        # Sysinternals Autologon keeps the password in the LSA secret store
+        # instead of the registry. Use it when it is available.
+        $stored = $false
+        $exe = Get-Command "autologon64.exe","autologon.exe" -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if ($exe) {
+            try {
+                & $exe.Source $env:USERNAME $env:COMPUTERNAME $plain /accepteula | Out-Null
+                if ($LASTEXITCODE -eq 0) {
+                    Remove-ItemProperty -Path $wl -Name "DefaultPassword" -ErrorAction SilentlyContinue
+                    $stored = $true
+                    Write-Host "  [ok] Automatic sign-in enabled (password stored encrypted)" -ForegroundColor Green
+                }
+            } catch { }
+        }
+
+        if (-not $stored) {
+            Set-ItemProperty -Path $wl -Name "DefaultPassword" -Value $plain -Force
+            Write-Host "  [ok] Automatic sign-in enabled" -ForegroundColor Green
+            Write-Host "  [!]  The Windows password is in the registry in PLAIN TEXT." -ForegroundColor Yellow
+            Write-Host "  [!]  Any administrator on this PC can read it." -ForegroundColor Yellow
+            Write-Host "  [!]  To store it encrypted instead: run netplwiz, untick the box," -ForegroundColor Yellow
+            Write-Host "  [!]  and enter the password there. That replaces this." -ForegroundColor Yellow
+        }
+        $plain = $null
+    } else {
+        Write-Host "  Automatic sign-in left unchanged." -ForegroundColor Yellow
+    }
+}
+
+Write-Host ""
+Write-Host "  Kiosk settings done." -ForegroundColor Green
+Start-Sleep -Seconds 4
+'@
+
+    $hardenFile = Join-Path $env:TEMP ("sk-kiosk-" + [Guid]::NewGuid().ToString("N").Substring(0,8) + ".ps1")
+    Set-Content -Path $hardenFile -Value $hardening -Encoding ASCII
+
+    $argList = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$hardenFile`"",
+                 "-ActiveHoursStart", $ActiveHoursStart, "-ActiveHoursEnd", $ActiveHoursEnd)
+    if (-not $SkipAutoLogon) { $argList += "-EnableAutoLogon" }
+
+    try {
+        if ($alreadyAdmin) {
+            Say "Applying kiosk settings..."
+            & powershell @argList
+        } else {
+            Say "Windows will ask permission to change these settings - click Yes."
+            Start-Process -FilePath "powershell" -ArgumentList $argList -Verb RunAs -Wait
+        }
+        Good "Kiosk settings applied"
+    } catch {
+        Warn "Kiosk settings were not applied: $($_.Exception.Message)"
+        Warn "The screen still works; it may sleep or show a screensaver."
+        Warn "To do it later, run this again and click Yes on the prompt."
+    }
+    Remove-Item $hardenFile -Force -ErrorAction SilentlyContinue
 }
 
 # ---------------------------------------------------------------------------
