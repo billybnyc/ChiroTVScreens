@@ -1,6 +1,10 @@
 {
-  "version": "20261031.1",
-  "note": "Turn off video fullscreen and the Escape key",
+  "version": "20261102.1",
+  "note": "Push session_keeper v9 to every screen; keep fullscreen off and no Escape key",
+  "script": {
+    "url": "https://raw.githubusercontent.com/billybnyc/chirotvscreens/main/session_keeper.py",
+    "sha256": "c515c27c8cc1fdf924452e62478d7c1ccee78455a0bb35e922ba5198a92fc7a4"
+  },
   "settings": {
     "FULLSCREEN_VIDEO": "false",
     "FINAL_KEYS": ""
