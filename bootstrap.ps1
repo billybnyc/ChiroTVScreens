@@ -55,7 +55,7 @@ function Fail ($m) { Write-Host ""; Write-Host "FAILED: $m" -ForegroundColor Red
 # PowerShell 5.1 negotiates TLS 1.0 by default; GitHub refuses it.
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
-$BootstrapBuild = "b2 (2026-11-02) - autologon on by default"
+$BootstrapBuild = "b3 (2026-11-02) - hidden console window"
 
 Write-Host ""
 Write-Host "  Session Keeper deploy  $BootstrapBuild" -ForegroundColor White
@@ -393,11 +393,77 @@ Start-Sleep -Seconds 4
 }
 
 # ---------------------------------------------------------------------------
+# Launcher: run with no visible console window
+#
+# The keeper runs for as long as the screen is on, so its console window
+# stays open the whole time and can end up in front of the browser. A tiny
+# VBScript starts the batch file with the window hidden instead.
+# ---------------------------------------------------------------------------
+Step "Making the launcher run hidden"
+
+$runBat = Join-Path $InstallDir "Start Session Keeper.bat"
+$runVbs = Join-Path $InstallDir "Start Session Keeper.vbs"
+
+$batText = @'
+@echo off
+cd /d "%~dp0"
+
+REM Exit code 86 means the keeper updated itself and wants to restart.
+:runloop
+".venv\Scripts\python.exe" session_keeper.py
+if errorlevel 87 goto finished
+if errorlevel 86 (
+    timeout /t 3 /nobreak >nul
+    goto runloop
+)
+:finished
+'@
+
+# No "pause" here on purpose: the window is hidden, so a pause would wait
+# forever on a keypress nobody can give it.
+Set-Content -Path $runBat -Value $batText -Encoding ASCII
+
+$vbsText = @'
+' Starts Session Keeper with no console window.
+Dim sh, here
+Set sh = CreateObject("WScript.Shell")
+here = Left(WScript.ScriptFullName, InStrRev(WScript.ScriptFullName, "\"))
+sh.CurrentDirectory = here
+sh.Run """" & here & "Start Session Keeper.bat""", 0, False
+'@
+Set-Content -Path $runVbs -Value $vbsText -Encoding ASCII
+Good "Hidden launcher written"
+
+# Point every shortcut at the VBS instead of the BAT.
+try {
+    $ws = New-Object -ComObject WScript.Shell
+    $targets = @(
+        [Environment]::GetFolderPath("Desktop"),
+        (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"),
+        (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup")
+    )
+    $fixed = 0
+    foreach ($folder in $targets) {
+        $lnk = Join-Path $folder "Session Keeper.lnk"
+        if (Test-Path $lnk) {
+            $s = $ws.CreateShortcut($lnk)
+            $s.TargetPath = $runVbs
+            $s.WorkingDirectory = $InstallDir
+            $s.WindowStyle = 7          # minimised, belt and braces
+            $s.Save()
+            $fixed++
+        }
+    }
+    if ($fixed -gt 0) { Good "$fixed shortcut(s) now start it hidden" }
+} catch {
+    Warn "Could not update the shortcuts: $($_.Exception.Message)"
+}
+
+# ---------------------------------------------------------------------------
 Step "Starting Session Keeper"
-$runner = Join-Path $InstallDir "Start Session Keeper.bat"
-if (Test-Path $runner) {
-    Start-Process -FilePath $runner -WorkingDirectory $InstallDir
-    Good "Started"
+if (Test-Path $runVbs) {
+    Start-Process -FilePath "wscript.exe" -ArgumentList "`"$runVbs`"" -WorkingDirectory $InstallDir
+    Good "Started (no console window)"
 } else {
     Warn "Launcher not found - start it from the Desktop shortcut."
 }
